@@ -1085,3 +1085,147 @@ def test_intersections_422_on_unparseable_stored_path(client):
     assert r.status_code == 422
     assert "无法解析" in r.json()["detail"]
 
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/hit-test 点位命中测试（只读）
+# ---------------------------------------------------------------------------
+
+def test_hit_test_basic_inside_outside_boundary(client):
+    # 外方 0..40 含孔 10..30（孔逆时针书写）：环带 inside、孔内 outside、
+    # 孔边与远处分别为 boundary / outside，结果按输入顺序返回
+    pid = _mk(client, "M0,0h40v40h-40Z M10,30h20v-20h-20Z")
+    r = client.post(f"/paths/{pid}/hit-test",
+                    json={"points": [{"x": 5, "y": 5},
+                                     {"x": 20, "y": 20},
+                                     {"x": 10, "y": 20},
+                                     {"x": 50, "y": 50}]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["fill_rule"] == "nonzero"
+    assert body["point_count"] == 4
+    assert body["checked_contour_count"] == 2
+    assert body["inside_count"] == 1
+    assert body["outside_count"] == 2
+    assert body["boundary_count"] == 1
+    assert body["skipped_contours"] == []
+    assert [p["index"] for p in body["results"]] == [0, 1, 2, 3]
+    assert [(p["x"], p["y"]) for p in body["results"]] == [
+        (5.0, 5.0), (20.0, 20.0), (10.0, 20.0), (50.0, 50.0)]
+    assert [p["result"] for p in body["results"]] == [
+        "inside", "outside", "boundary", "outside"]
+
+
+def test_hit_test_fill_rule_difference(client):
+    # 同向嵌套正方形：内点 nonzero 绕数 2 -> inside，evenodd 交叉 2 次 -> outside
+    d = "M0,0h40v40h-40Z M10,10h20v20h-20Z"
+    pid_nz = _mk(client, d, fill_rule="nonzero")
+    pid_eo = _mk(client, d, fill_rule="evenodd")
+    pt = {"points": [{"x": 20, "y": 20}, {"x": 5, "y": 5}]}
+    body = client.post(f"/paths/{pid_nz}/hit-test", json=pt).json()
+    assert [p["result"] for p in body["results"]] == ["inside", "inside"]
+    body = client.post(f"/paths/{pid_eo}/hit-test", json=pt).json()
+    assert body["fill_rule"] == "evenodd"
+    assert [p["result"] for p in body["results"]] == ["outside", "inside"]
+
+
+def test_hit_test_open_skipped_closed_degenerate_participates(client):
+    # 开放折线不参与（列入 skipped）；零净面积闭合自交蝴蝶结仍参与：
+    # 左瓣内 (2,5) inside，上瓣外 (5,2) outside，交点 (5,5) 在边上 boundary
+    pid = _mk(client, "M0,0 L10,10 L10,0 L0,10 Z M20,0 L30,0 L30,10")
+    r = client.post(f"/paths/{pid}/hit-test",
+                    json={"points": [{"x": 2, "y": 5},
+                                     {"x": 5, "y": 2},
+                                     {"x": 5, "y": 5},
+                                     {"x": 25, "y": 5}]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["checked_contour_count"] == 1
+    assert [p["result"] for p in body["results"]] == [
+        "inside", "outside", "boundary", "outside"]
+    assert body["skipped_contours"] == [
+        {"original_index": 1, "role": "open", "reason": "open"}]
+
+
+def test_hit_test_empty_path_all_outside(client):
+    pid = _mk(client, "")
+    body = client.post(f"/paths/{pid}/hit-test",
+                       json={"points": [{"x": 0, "y": 0}]}).json()
+    assert body["checked_contour_count"] == 0
+    assert body["results"][0]["result"] == "outside"
+    assert body["outside_count"] == 1
+
+
+def test_hit_test_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    pt = {"points": [{"x": 5, "y": 5}, {"x": 1, "y": 1}]}
+    assert client.post(f"/paths/{pid}/hit-test", json=pt).status_code == 200
+    # 即时计算不写库
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    b1 = client.post(f"/paths/{pid}/hit-test", json=pt).json()
+    b2 = client.post(f"/paths/{pid}/hit-test", json=pt).json()
+    assert b1 == b2
+
+
+def test_hit_test_404(client):
+    r = client.post("/paths/999999/hit-test",
+                    json={"points": [{"x": 0, "y": 0}]})
+    assert r.status_code == 404
+
+
+def test_hit_test_id_path_validation(client):
+    pt = {"points": [{"x": 0, "y": 0}]}
+    assert client.post("/paths/x/hit-test", json=pt).status_code == 422
+    assert client.post("/paths/0/hit-test", json=pt).status_code == 404
+
+
+def test_hit_test_422_on_invalid_points(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    url = f"/paths/{pid}/hit-test"
+    # 无点 / 空列表 / 缺字段 / 非数字 / 非有限数均 422
+    assert client.post(url, json={}).status_code == 422
+    assert client.post(url, json={"points": []}).status_code == 422
+    assert client.post(url, json={"points": [{"x": 1}]}).status_code == 422
+    assert client.post(url, json={"points": [{"y": 1}]}).status_code == 422
+    assert client.post(url,
+                       json={"points": [{"x": "a", "y": 1}]}).status_code == 422
+    assert client.post(url,
+                       json={"points": [{"x": "nan", "y": 1}]}).status_code == 422
+    assert client.post(url,
+                       json={"points": [{"x": 1, "y": "inf"}]}).status_code == 422
+    # 超大数（JSON 解析为 Infinity）也必须是 422 而不是 500
+    r = client.post(url,
+                    content='{"points": [{"x": 1e999, "y": 0}]}',
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+
+
+def test_hit_test_point_limit(client):
+    from app.hittest import MAX_POINTS
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    url = f"/paths/{pid}/hit-test"
+    # 恰好 500 个放行
+    pts = [{"x": 5, "y": 5}] * MAX_POINTS
+    r = client.post(url, json={"points": pts})
+    assert r.status_code == 200
+    assert r.json()["point_count"] == MAX_POINTS
+    assert r.json()["inside_count"] == MAX_POINTS
+    # 超过 500 个 -> 422
+    r = client.post(url, json={"points": pts + [{"x": 5, "y": 5}]})
+    assert r.status_code == 422
+
+
+def test_hit_test_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/hit-test",
+                    json={"points": [{"x": 0, "y": 0}]})
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+

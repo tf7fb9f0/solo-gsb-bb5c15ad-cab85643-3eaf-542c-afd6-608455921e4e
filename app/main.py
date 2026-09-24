@@ -9,6 +9,7 @@
     POST /paths/{id}/cut-plan    闭合轮廓加工计划（后代先加工 + 最近入刀点贪心）
     POST /paths/{id}/tabs        外环微桥布置（周长等分扇区 + 拐角余量/不重叠约束）
     POST /paths/{id}/intersections 只读：加工前轮廓交叉清单（自交/互交/接触/共线重叠）
+    POST /paths/{id}/hit-test  只读：点位命中测试（inside / outside / boundary）
     POST /paths/compare          两条已存路径的版本差异审计（指纹匹配 + 三类变更）
     GET  /paths/{id}             查询原始路径、规范化结果及边界警告
     GET  /healthz                存活/就绪探针
@@ -31,6 +32,7 @@ from . import db
 from .clearance import check_clearance
 from .cutplan import compute_cut_plan
 from .diff import compare_normalized
+from .hittest import MAX_POINTS, compute_hit_test
 from .intersections import find_intersections
 from .metrics import compute_metrics
 from .scanlines import MAX_SCANLINES, compute_scanlines
@@ -46,11 +48,11 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SVG 轮廓规范化 API",
-    version="1.7.0",
+    version="1.8.0",
     description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向，"
                 "支持填充面积与面积质心分析、水平扫描线填充区间、"
-                "轮廓间安全间隙校验、闭合轮廓加工计划、外环微桥布置"
-                "与两条已存路径的版本差异审计。",
+                "轮廓间安全间隙校验、闭合轮廓加工计划、外环微桥布置、"
+                "点位命中测试与两条已存路径的版本差异审计。",
     lifespan=lifespan,
 )
 
@@ -163,6 +165,24 @@ class TabsIn(BaseModel):
         if not math.isfinite(v):
             raise ValueError("微桥参数必须是有限数值")
         return v
+
+
+class HitTestPoint(BaseModel):
+    x: float = Field(..., description="测试点 x 坐标（必须为有限数值）")
+    y: float = Field(..., description="测试点 y 坐标（必须为有限数值）")
+
+    @field_validator("x", "y")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("测试点坐标必须是有限数值")
+        return v
+
+
+class HitTestIn(BaseModel):
+    points: list[HitTestPoint] = Field(
+        ..., min_length=1, max_length=MAX_POINTS,
+        description=f"测试点列表（1~{MAX_POINTS} 个，按输入顺序逐点返回判定）")
 
 
 # ---------------------------------------------------------------------------
@@ -425,4 +445,25 @@ def intersections(path_id: int,
                             detail=f"SVG path 无法解析: {exc}")
 
     result = find_intersections(contours)
+    return {"id": path_id, "fill_rule": row["fill_rule"], **result}
+
+
+@app.post("/paths/{path_id}/hit-test")
+def hit_test(path_id: int,
+             payload: HitTestIn,
+             conn: Connection = Depends(get_db)) -> dict[str, Any]:
+    row = _get_row(conn, path_id)
+
+    # 即时解析/细分：不依赖已保存的规范化结果，也不写库
+    try:
+        contours, _warnings = _analyze_row(row)
+    except SVGPathError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"SVG path 无法解析: {exc}")
+
+    result = compute_hit_test(
+        contours,
+        points=[(p.x, p.y) for p in payload.points],
+        fill_rule=row["fill_rule"],
+    )
     return {"id": path_id, "fill_rule": row["fill_rule"], **result}

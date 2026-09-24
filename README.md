@@ -16,7 +16,10 @@
 互不重叠的微桥，输出桥段起终点/中心坐标与弧长并报告未能放置的数量）、
 **`POST /paths/{id}/intersections` 加工前轮廓交叉清单**
 （只读检查细分折线的自交与子路径互交，报告交叉 / 端点接触 / 共线重叠
-的类型、交点坐标及原始轮廓与边索引）
+的类型、交点坐标及原始轮廓与边索引）、
+**`POST /paths/{id}/hit-test` 点位命中测试**
+（对最多 500 个测试点逐点判定 inside / outside / boundary：边界优先，
+其余按保存的 fill_rule 以交叉次数奇偶（evenodd）或有向边绕数（nonzero）汇总）
 与 **`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
@@ -36,8 +39,9 @@
 │   ├── cutplan.py     # 闭合轮廓加工计划：后代先加工 + 最近入刀点贪心、逐段空走距离
 │   ├── tabs.py        # 外环微桥布置：周长等分扇区、拐角余量/互不重叠约束、逐桥段坐标与弧长
 │   ├── intersections.py # 加工前轮廓交叉清单：非相邻边自交/子路径互交、交叉/接触/共线重叠分类合并
+│   ├── hittest.py     # 点位命中测试：边界优先 + evenodd 交叉奇偶 / nonzero 有向边绕数
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（222 个）
+├── tests/             # pytest 单元 + API 端到端测试（251 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -595,6 +599,72 @@ curl -s -X POST localhost:8000/paths/1/intersections
 干净的轮廓（如外方 + 不接触的内孔）与空路径返回空清单
 （`intersection_count` 为 `0`、`intersections` 为 `[]`）。
 
+### `POST /paths/{id}/hit-test` — 点位命中测试（只读）
+
+对已存路径**即时解析**（复用与 metrics / scanlines / intersections 相同的
+曲线细分折线，无需事先调用 normalize，**不写数据库**），对请求中的每个
+测试点逐边判定并返回 `inside` / `outside` / `boundary`：
+
+- **参与规则**：原始 `d` 中的**全部闭合子路径**参与（含零净面积的
+  闭合自交路径等闭合退化轮廓）；**开放子路径不参与**，列入
+  `skipped_contours`；
+- **边界优先**：点落在任一参与子路径的任一条细分边上（含端点，
+  容差按环尺寸自适应）直接判 `boundary`，不再做填充汇总；
+- **填充汇总**（对其余点按保存的 `fill_rule` 统计全部闭合子路径的
+  +x 射线穿越）：
+  - `evenodd`：交叉次数（半开边规则 `(y1 > y) != (y2 > y)`，水平边
+    不计、顶点不重复计数）为**奇数**时 `inside`；
+  - `nonzero`：**有向边绕数**（上行边左穿 +1、下行边右穿 −1）
+    **非零**时 `inside`——同向嵌套环的内层仍为 `inside`，反向孔内为
+    `outside`。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `points` | object[] | 测试点列表，**1~500 个**，每项 `{"x": number, "y": number}`，坐标必须为有限数值（NaN/无穷/非数字返回 `422`） |
+
+```bash
+# 外方 0..40 含反向孔 10..30：环带 inside、孔内 outside、孔边 boundary
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h40v40h-40Z M10,30h20v-20h-20Z"
+}'
+curl -s -X POST localhost:8000/paths/1/hit-test \
+  -H 'Content-Type: application/json' \
+  -d '{"points": [{"x": 5, "y": 5}, {"x": 20, "y": 20}, {"x": 10, "y": 20}, {"x": 50, "y": 50}]}'
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "point_count": 4,
+  "checked_contour_count": 2,
+  "inside_count": 1,
+  "outside_count": 2,
+  "boundary_count": 1,
+  "results": [
+    {"index": 0, "x": 5.0, "y": 5.0, "result": "inside"},
+    {"index": 1, "x": 20.0, "y": 20.0, "result": "outside"},
+    {"index": 2, "x": 10.0, "y": 20.0, "result": "boundary"},
+    {"index": 3, "x": 50.0, "y": 50.0, "result": "outside"}
+  ],
+  "skipped_contours": []
+}
+```
+
+- `results[]`：**按输入顺序**逐点给出 `index`、回显坐标 `x` / `y` 与
+  判定 `result`（`inside` / `outside` / `boundary`）；
+- `checked_contour_count`：参与判定的闭合子路径数；
+  `inside_count` / `outside_count` / `boundary_count` 为三种判定的合计；
+- `skipped_contours[]`：未参与的开放子路径及 `reason`（`open`）；
+- 同一几何在两种 `fill_rule` 下可能不同：同向嵌套正方形的内层点
+  `nonzero` 判 `inside`（绕数 2）、`evenodd` 判 `outside`（交叉 2 次）；
+- 路径不存在返回 `404`；`points` 缺失/为空/超过 500 个或坐标非有限数
+  返回 `422`；已存路径无法解析（历史脏数据）返回 `422`。
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -740,7 +810,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 222 passed
+pytest -q          # 251 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -774,7 +844,13 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 （区间两端与重叠并存）、不同子路径交叉/角点接触/T 接触/共线重叠、
 三轮廓同点同类型合并边索引、开放轮廓跳过且不与闭合轮廓比较、闭合退化轮廓
 仍参与、单点闭合、贝塞尔/弧细分后求交、按轮廓与边索引稳定排序、跨调用
-确定性、两种填充规则一致、空路径空清单、只读不落库、404/非法 id/脏数据 422 等。
+确定性、两种填充规则一致、空路径空清单、只读不落库、404/非法 id/脏数据 422 等；
+点位命中测试的 inside/outside/boundary 基本判定、边界优先（孔边/顶点）、
+输入顺序与坐标回显、同向嵌套环 nonzero 绕数 2 与 evenodd 交叉 2 次的分歧、
+反向孔绕数抵消、绕数符号无关、外-孔-岛三层两种规则一致、零净面积闭合自交
+路径仍参与、闭合退化线段环边界、开放子路径不参与（其边上点不判 boundary）、
+仅开放/空路径全 outside、曲线细分边、500 点上限与超限 422、空点列表/非有限
+坐标 422、跨调用确定性与只读不落库、404/非法 id/脏数据 422 等。
 
 ## 数据存储
 
