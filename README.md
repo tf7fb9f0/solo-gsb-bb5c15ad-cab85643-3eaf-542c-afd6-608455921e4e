@@ -16,7 +16,10 @@
 互不重叠的微桥，输出桥段起终点/中心坐标与弧长并报告未能放置的数量）、
 **`POST /paths/{id}/intersections` 加工前轮廓交叉清单**
 （只读检查细分折线的自交与子路径互交，报告交叉 / 端点接触 / 共线重叠
-的类型、交点坐标及原始轮廓与边索引）
+的类型、交点坐标及原始轮廓与边索引）、
+**`POST /paths/{id}/hit-test` 批量点命中测试**
+（最多 500 个有限坐标点，逐边判定 boundary 优先，其余按保存的
+evenodd / nonzero 填充规则汇总为 inside / outside，开放子路径不参与）
 与 **`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
@@ -36,8 +39,9 @@
 │   ├── cutplan.py     # 闭合轮廓加工计划：后代先加工 + 最近入刀点贪心、逐段空走距离
 │   ├── tabs.py        # 外环微桥布置：周长等分扇区、拐角余量/互不重叠约束、逐桥段坐标与弧长
 │   ├── intersections.py # 加工前轮廓交叉清单：非相邻边自交/子路径互交、交叉/接触/共线重叠分类合并
+│   ├── hittest.py      # 批量点命中测试：boundary 优先，evenodd 交叉奇偶 / nonzero 有向边绕数
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（222 个）
+├── tests/             # pytest 单元 + API 端到端测试（262 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -595,6 +599,73 @@ curl -s -X POST localhost:8000/paths/1/intersections
 干净的轮廓（如外方 + 不接触的内孔）与空路径返回空清单
 （`intersection_count` 为 `0`、`intersections` 为 `[]`）。
 
+### `POST /paths/{id}/hit-test` — 批量点命中测试（只读）
+
+对已存路径的**原始 `d` 即时解析**（复用与 metrics / clearance / intersections
+相同的曲线细分折线，无需事先调用 normalize，**不写规范化状态、不写数据库**），
+对一批坐标点逐点给出 `inside` / `outside` / `boundary` 判定：
+
+- **boundary 优先**：点落在任一**闭合子路径**细分折线的**任一条边**
+  （含末点回首点的闭合边与边的端点）上即判 `boundary`，不再参与填充汇总；
+  边界容差按环尺寸自适应（与规范化包含判定同口径）；
+- 其余点按**保存的 `fill_rule`** 对全部闭合子路径汇总：
+  - `evenodd`：右向水平射线**交叉次数为奇数** → `inside`，偶数 → `outside`；
+  - `nonzero`：**有向边绕数非零** → `inside`，为零 → `outside`
+    （同向重叠轮廓绕数累加、反向重叠相互抵消）；
+- **开放子路径**（未以 `Z` 闭合）不参与——点落在开放折线上也不是
+  `boundary`，列入 `skipped_contours`；**闭合但净面积为 0** 的自交路径
+  （如蝴蝶结）仍按字面参与，其自交分区仍可被填充；
+- 交叉/绕数计数采用与 scanlines 相同的**半开边规则**
+  `(y1 > y) != (y2 > y)`：水平边永不计数，穿过顶点时只被上行/下行
+  两条邻边之一计数；
+- 结果**按输入顺序**返回；单次最多 **500** 个点，每个坐标必须是有限数
+  （NaN/无穷/非数字、空点列表或超过 500 个点返回 `422`）。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `points` | `{x: number, y: number}[]` | 查询点列表，**1 ~ 500** 个有限坐标点，必填 |
+
+```bash
+# 先写入：外方 0..10（顺时针）+ 内孔 2..8（逆时针，nonzero 下绕数抵消）
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h10v10h-10Z M2,8h6v-6h-6Z", "fill_rule": "nonzero"
+}'
+# 点依次为：外框内 / 孔内 / 孔边上 / 外框顶点
+curl -s -X POST localhost:8000/paths/1/hit-test \
+  -H 'Content-Type: application/json' \
+  -d '{"points": [{"x":1,"y":1}, {"x":5,"y":5}, {"x":5,"y":2}, {"x":0,"y":0}]}'
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "point_count": 4,
+  "checked_contour_count": 2,
+  "results": [
+    {"index": 0, "point": {"x": 1.0, "y": 1.0}, "result": "inside"},
+    {"index": 1, "point": {"x": 5.0, "y": 5.0}, "result": "outside"},
+    {"index": 2, "point": {"x": 5.0, "y": 2.0}, "result": "boundary"},
+    {"index": 3, "point": {"x": 0.0, "y": 0.0}, "result": "boundary"}
+  ],
+  "skipped_contours": []
+}
+```
+
+- `results[]`：与输入等长、同序，每项含 `index`（从 0 开始）、
+  回显坐标 `point` 与 `result`（`inside` / `outside` / `boundary`）；
+- `checked_contour_count`：参与判定的闭合子路径数（含闭合退化/零面积
+  自交路径）；`skipped_contours[]` 为未参与的非闭合子路径，每项含
+  `original_index`、`role` 与 `reason`（`open` / `degenerate`）；
+- 注意命中判定基于**原始子路径方向**：同向绘制的内方在 `nonzero` 下
+  会被填充（绕数累加），只有反向轮廓才作为孔抵消；`evenodd` 不依赖方向；
+- 路径不存在返回 `404`；`points` 缺失/为空/超过 500 个、坐标缺失/非数字/
+  非有限数返回 `422`；已存路径无法解析返回 `422`。
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -740,7 +811,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 222 passed
+pytest -q          # 262 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -774,7 +845,16 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 （区间两端与重叠并存）、不同子路径交叉/角点接触/T 接触/共线重叠、
 三轮廓同点同类型合并边索引、开放轮廓跳过且不与闭合轮廓比较、闭合退化轮廓
 仍参与、单点闭合、贝塞尔/弧细分后求交、按轮廓与边索引稳定排序、跨调用
-确定性、两种填充规则一致、空路径空清单、只读不落库、404/非法 id/脏数据 422 等。
+确定性、两种填充规则一致、空路径空清单、只读不落库、404/非法 id/脏数据 422 等；
+批量点命中测试的单环 inside/outside、各边与闭合边 boundary 优先、对角线/
+斜边命中、外-孔在两种填充规则下一致、同向重叠 nonzero 填充而 evenodd
+留空、反向重叠绕数抵消、三重重叠奇偶、蝴蝶结等零净面积闭合自交路径仍
+参与（叶内 inside、叶间 outside、自交点 boundary）、闭合退化线段/点只
+贡献 boundary、开放子路径（含两点退化开放线）不参与且落在其上也不是
+boundary、空路径全 outside、曲线细分顶点命中、凹多边形半开边顶点规则、
+按输入顺序回显索引与坐标、两种填充规则差异、最多 500 点边界（恰好 500
+放行、501 拒绝）、空列表/缺字段/非数字/NaN/Infinity/1e999 返回 422、
+确定性与只读不落库、404/非法 id/脏数据 422 等。
 
 ## 数据存储
 

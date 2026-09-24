@@ -1085,3 +1085,168 @@ def test_intersections_422_on_unparseable_stored_path(client):
     assert r.status_code == 422
     assert "无法解析" in r.json()["detail"]
 
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/hit-test 批量点命中测试（只读）
+# ---------------------------------------------------------------------------
+
+def test_hit_test_inside_outside_boundary_order(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    r = client.post(f"/paths/{pid}/hit-test", json={"points": [
+        {"x": 5, "y": 5}, {"x": -1, "y": 5}, {"x": 0, "y": 5},
+        {"x": 10, "y": 10}, {"x": 5, "y": 0}]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["fill_rule"] == "nonzero"
+    assert body["point_count"] == 5
+    assert body["checked_contour_count"] == 1
+    assert body["skipped_contours"] == []
+    assert [item["result"] for item in body["results"]] == [
+        "inside", "outside", "boundary", "boundary", "boundary"]
+    assert [item["index"] for item in body["results"]] == [0, 1, 2, 3, 4]
+    assert body["results"][0]["point"] == {"x": 5.0, "y": 5.0}
+
+
+def test_hit_test_uses_saved_fill_rule(client):
+    # 两个同向方块重叠：nonzero 填充，evenodd 留空
+    d = "M0,0h10v10h-10Z M0,0h10v10h-10Z"
+    nz = _mk(client, d, fill_rule="nonzero")
+    eo = _mk(client, d, fill_rule="evenodd")
+    body = client.post(f"/paths/{nz}/hit-test",
+                       json={"points": [{"x": 5, "y": 5}]}).json()
+    assert body["fill_rule"] == "nonzero"
+    assert body["results"][0]["result"] == "inside"
+    body = client.post(f"/paths/{eo}/hit-test",
+                       json={"points": [{"x": 5, "y": 5}]}).json()
+    assert body["fill_rule"] == "evenodd"
+    assert body["results"][0]["result"] == "outside"
+
+
+def test_hit_test_nonzero_opposite_winding_cancels(client):
+    # 外框顺时针 + 同几何逆时针：绕数抵消为 0
+    pid = _mk(client,
+              "M0,0h10v10h-10Z M0,0 L0,10 L10,10 L10,0 Z",
+              fill_rule="nonzero")
+    body = client.post(f"/paths/{pid}/hit-test",
+                       json={"points": [{"x": 5, "y": 5}]}).json()
+    assert body["results"][0]["result"] == "outside"
+
+
+def test_hit_test_boundary_takes_priority(client):
+    # 点同时在孔边（交叉为偶数本应 outside）上 -> 一律 boundary
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z", fill_rule="evenodd")
+    body = client.post(f"/paths/{pid}/hit-test", json={"points": [
+        {"x": 5, "y": 2}, {"x": 2, "y": 2}, {"x": 5, "y": 5}]}).json()
+    assert [i["result"] for i in body["results"]] == [
+        "boundary", "boundary", "outside"]
+
+
+def test_hit_test_open_subpaths_skipped(client):
+    # 开放折线不参与：点落在开放折线上也只是 outside
+    pid = _mk(client, "M0,0h10v10h-10Z M20,0 L30,0 L30,10")
+    body = client.post(f"/paths/{pid}/hit-test", json={"points": [
+        {"x": 5, "y": 5}, {"x": 25, "y": 0}]}).json()
+    assert [i["result"] for i in body["results"]] == ["inside", "outside"]
+    assert body["checked_contour_count"] == 1
+    assert body["skipped_contours"] == [
+        {"original_index": 1, "role": "open", "reason": "open"}]
+
+
+def test_hit_test_zero_area_closed_self_intersection_participates(client):
+    # 蝴蝶结（零净面积闭合自交）：叶内 inside、两叶之间 outside
+    pid = _mk(client, "M0,0 L10,10 L10,0 L0,10 Z")
+    body = client.post(f"/paths/{pid}/hit-test", json={"points": [
+        {"x": 1, "y": 5}, {"x": 5, "y": 2}, {"x": 5, "y": 5}]}).json()
+    assert [i["result"] for i in body["results"]] == [
+        "inside", "outside", "boundary"]
+    assert body["skipped_contours"] == []
+    assert body["checked_contour_count"] == 1
+
+
+def test_hit_test_curve_flattened(client):
+    pid = _mk(client, "M-1,0 A1,1 0 1,0 1,0 A1,1 0 1,0 -1,0 Z")
+    body = client.post(f"/paths/{pid}/hit-test", json={"points": [
+        {"x": 0, "y": 0}, {"x": -1, "y": 0}, {"x": 2, "y": 0}]}).json()
+    assert [i["result"] for i in body["results"]] == [
+        "inside", "boundary", "outside"]
+
+
+def test_hit_test_empty_path_all_outside(client):
+    pid = _mk(client, "")
+    body = client.post(f"/paths/{pid}/hit-test",
+                       json={"points": [{"x": 0, "y": 0}]}).json()
+    assert body["results"][0]["result"] == "outside"
+    assert body["checked_contour_count"] == 0
+
+
+def test_hit_test_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    assert client.post(f"/paths/{pid}/hit-test",
+                       json={"points": [{"x": 5, "y": 5}]}).status_code == 200
+    # 即时计算不写库，重复调用一致
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    payload = {"points": [{"x": 1, "y": 1}, {"x": 5, "y": 5}]}
+    b1 = client.post(f"/paths/{pid}/hit-test", json=payload).json()
+    b2 = client.post(f"/paths/{pid}/hit-test", json=payload).json()
+    assert b1 == b2
+
+
+def test_hit_test_404(client):
+    assert client.post("/paths/999999/hit-test",
+                       json={"points": [{"x": 0, "y": 0}]}).status_code == 404
+
+
+def test_hit_test_id_path_validation(client):
+    assert client.post("/paths/x/hit-test",
+                       json={"points": [{"x": 0, "y": 0}]}).status_code == 422
+    assert client.post("/paths/0/hit-test",
+                       json={"points": [{"x": 0, "y": 0}]}).status_code == 404
+
+
+def test_hit_test_422_on_invalid_points(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    url = f"/paths/{pid}/hit-test"
+    # 空点列表
+    assert client.post(url, json={"points": []}).status_code == 422
+    # 缺少 points
+    assert client.post(url, json={}).status_code == 422
+    # 点缺坐标 / 非数字
+    assert client.post(url, json={"points": [{"x": 1}]}).status_code == 422
+    assert client.post(url, json={"points": [{"x": "a", "y": 0}]}).status_code == 422
+    assert client.post(url, json={"points": [{"x": 0, "y": "nan"}]}).status_code == 422
+    # NaN / Infinity / 超大数（非有限）均须 422
+    assert client.post(url,
+                       content='{"points":[{"x":1e999,"y":0}]}',
+                       headers={"Content-Type": "application/json"}).status_code == 422
+    assert client.post(url,
+                       content='{"points":[{"x":0,"y":-1e999}]}',
+                       headers={"Content-Type": "application/json"}).status_code == 422
+
+
+def test_hit_test_422_when_over_500_points(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    url = f"/paths/{pid}/hit-test"
+    pts = [{"x": 0, "y": 0}] * 500
+    r = client.post(url, json={"points": pts})
+    assert r.status_code == 200
+    assert r.json()["point_count"] == 500
+    pts501 = [{"x": 0, "y": 0}] * 501
+    r = client.post(url, json={"points": pts501})
+    assert r.status_code == 422
+
+
+def test_hit_test_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/hit-test",
+                    json={"points": [{"x": 0, "y": 0}]})
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+
